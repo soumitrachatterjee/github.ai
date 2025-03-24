@@ -1,60 +1,99 @@
-import requests
-import configparser
 import argparse
+import configparser
+import os
+import requests
+import json
+from transformers import pipeline, BartTokenizer
 
-def load_config(config_file="config.ini"):
+# Load configuration
+CONFIG_FILE = "config.ini"
+
+def load_config():
     config = configparser.ConfigParser()
-    config.read(config_file)
-    return config
+    config.read(CONFIG_FILE)
+    return config["GitHub"]
 
-def get_github_data(url, headers):
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        return response.json()
-    else:
-        print(f"Error fetching data: {response.status_code} - {response.text}")
-        return None
+# Get GitHub Token from ENV
+def get_github_token():
+    token = os.getenv("GITHUB_PAT")
+    if not token:
+        raise ValueError("ERROR: GitHub PAT is missing. Set it using `export GITHUB_PAT=<your_token>`")
+    return token
 
-def summarize_pr(pr_data):
-    title = pr_data.get("title", "No Title")
-    #body = pr_data.get("body", "No Description").split("\n")[0]  # First line as summary
-    body = pr_data.get("body", "No Description")
-    url = pr_data.get("html_url", "No URL")
-    return f"**PR Summary:**\n{title}\n{body}\nFull PR: {url}"
+# GitHub API Helper Functions
+def get_github_headers():
+    token = get_github_token()
+    return {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
 
-def summarize_issue(issue_data):
-    title = issue_data.get("title", "No Title")
-    #body = issue_data.get("body", "No Description").split("\n")[0]  # First line as summary
-    body = issue_data.get("body", "No Description")
-    url = issue_data.get("html_url", "No URL")
-    return f"**Issue Summary:**\n{title}\n{body}\nFull Issue: {url}"
+def fetch_github_pr(owner, repo, pr_number):
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
+    response = requests.get(url, headers=get_github_headers())
+    return response.json() if response.status_code == 200 else None
 
-def main():
+def fetch_github_issue(owner, repo, issue_number):
+    url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}"
+    response = requests.get(url, headers=get_github_headers())
+    return response.json() if response.status_code == 200 else None
+
+# Summarization Function using BERTSUM
+def summarize_text(text, max_length=150):
+    summarizer = pipeline("summarization", model="facebook/bart-large-cnn", tokenizer="facebook/bart-large-cnn")
+    tokenizer = BartTokenizer.from_pretrained("facebook/bart-large-cnn")
+
+    max_input_tokens = 1024  # BART's max token length
+    input_tokens = tokenizer.encode(text, truncation=True, max_length=max_input_tokens)
+
+    if len(input_tokens) > max_input_tokens:
+        print(f"⚠️ Input text too long ({len(input_tokens)} tokens). Truncating to {max_input_tokens} tokens.")
+        input_tokens = input_tokens[:max_input_tokens]
+    
+    # Convert tokens back to string for the model
+    truncated_text = tokenizer.decode(input_tokens, skip_special_tokens=True)
+
+    # Summarize with strict constraints
+    summary = summarizer(truncated_text, max_length=max_length, min_length=50, truncation=True, do_sample=False)
+    
+    return summary[0]["summary_text"]
+
+# Main Function to Process PRs or Issues
+def process_github_request(pr_number=None, issue_number=None):
     config = load_config()
-    github_url = config["GitHub"]["api_url"]
-    repo_owner = config["GitHub"]["repo_owner"]
-    repo_name = config["GitHub"]["repo_name"]
-    access_token = config["GitHub"]["access_token"]
-    
-    headers = {"Authorization": f"token {access_token}"}
-    
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--pr_number", type=int, help="Pull request number")
-    parser.add_argument("--issue_number", type=int, help="Issue number")
-    args = parser.parse_args()
-    
-    if args.pr_number:
-        pr_url = f"{github_url}/repos/{repo_owner}/{repo_name}/pulls/{args.pr_number}"
-        pr_data = get_github_data(pr_url, headers)
-        if pr_data:
-            print(summarize_pr(pr_data))
-    elif args.issue_number:
-        issue_url = f"{github_url}/repos/{repo_owner}/{repo_name}/issues/{args.issue_number}"
-        issue_data = get_github_data(issue_url, headers)
-        if issue_data:
-            print(summarize_issue(issue_data))
-    else:
-        print("Please provide either --pr_number or --issue_number")
+    owner, repo = config["repo_owner"], config["repo_name"]
 
+    if pr_number:
+        pr_data = fetch_github_pr(owner, repo, pr_number)
+        if not pr_data:
+            print(f"ERROR: PR #{pr_number} not found.")
+            return
+        
+        title = pr_data["title"]
+        body = pr_data.get("body", "No description provided.")
+        summary = summarize_text(body)
+
+        print(f"\nPR Summary:\nTitle: {title}\nSummary: {summary}\nFull PR: {pr_data['html_url']}")
+    
+    elif issue_number:
+        issue_data = fetch_github_issue(owner, repo, issue_number)
+        if not issue_data:
+            print(f"ERROR: Issue #{issue_number} not found.")
+            return
+        
+        title = issue_data["title"]
+        body = issue_data.get("body", "No description provided.")
+        summary = summarize_text(body)
+
+        print(f"\nIssue Summary:\nTitle: {title}\nSummary: {summary}\nFull Issue: {issue_data['html_url']}")
+
+# Argument Parsing
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Summarize GitHub PRs and Issues.")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--pr_number", type=int, help="GitHub Pull Request number")
+    group.add_argument("--issue_number", type=int, help="GitHub Issue number")
+    return parser.parse_args()
+
+# Run the script
 if __name__ == "__main__":
-    main()
+    args = parse_arguments()
+    process_github_request(pr_number=args.pr_number, issue_number=args.issue_number)
+
